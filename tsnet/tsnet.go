@@ -301,6 +301,8 @@ type Server struct {
 	// document. Note that advertising a tag on the client doesn't guarantee
 	// that the control server will allow the node to adopt that tag.
 	AdvertiseTags []string
+	// NOVA_MOD: allow disable log tail to enforce privacy.
+	DisableLogTail bool
 
 	// Tun, if non-nil, specifies a custom tun.Device to use for packet I/O.
 	//
@@ -1041,6 +1043,10 @@ func (s *Server) resolveAuthKey() (string, error) {
 
 func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker, tsLogf logger.Logf) error {
 	if testenv.InTest() {
+		return nil
+	}
+	// NOVA_MOD:
+	if s.DisableLogTail {
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
