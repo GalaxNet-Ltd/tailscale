@@ -124,6 +124,9 @@ type Server struct {
 	// field at zero unless you know what you are doing.
 	Port uint16
 
+	// NOVA_MOD: allow disable log tail to enforce privacy.
+	DisableLogTail bool
+
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	initOnce         sync.Once
@@ -701,6 +704,10 @@ func (s *Server) start() (reterr error) {
 
 func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker, tsLogf logger.Logf) error {
 	if testenv.InTest() {
+		return nil
+	}
+	// NOVA_MOD:
+	if s.DisableLogTail {
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
