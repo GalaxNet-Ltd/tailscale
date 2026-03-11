@@ -249,3 +249,21 @@ func rtaxName(i int) string {
 	}
 	return fmt.Sprint(i)
 }
+
+
+// NOVA_MOD: add a try heal interface which is used to fix when the fd
+// maybe killed due to unknown darwin behavior...
+func (m *darwinRouteMon) TryHeal() error {
+	// We try to heal by allocate a new fd to monitor route changes
+	// then close it.
+	// This will prevent us to need to using NWPathLinkMonitor in swift
+	// side and call back to go part to trigger it.
+	fdNew, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, 0)
+	if err != nil {
+		return err
+	}
+	unix.Close(m.fd)
+	m.fd = fdNew
+
+	return nil
+}
