@@ -57,6 +57,10 @@ type osMon interface {
 	// until the osMon is closed. After a Close, the returned
 	// error is ignored.
 	Receive() (message, error)
+
+	// NOVA_MOD: add a try heal interface which is used to fix when the fd
+	// maybe killed due to unknown darwin behavior...
+	TryHeal() error
 }
 
 // IsInterestingInterface is the function used to determine whether
@@ -579,6 +583,11 @@ func (m *Monitor) pump() {
 			}
 			// Keep retrying while we're not closed.
 			m.logf("error from link monitor: %v", err)
+			// NOVA_MOD: when om failed to work, it will not find def route interface
+			// when Network switching, thus rebind is not working which cause many issues
+			// such as leaving a WiFi not in range.
+			errHeal := m.om.TryHeal()
+			m.logf("trying to heal the link monitor error: %v", errHeal)
 			time.Sleep(time.Second)
 			continue
 		}
