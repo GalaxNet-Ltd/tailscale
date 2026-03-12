@@ -509,6 +509,98 @@ func TestLoopbackLocalAPI(t *testing.T) {
 	}
 }
 
+// NOVA_MOD: add test for restart loopback listener.
+func TestRestartLoopbackIfNeeded(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/8557")
+	tstest.Shard(t)
+	tstest.ResourceCheck(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	controlURL, _ := startControl(t)
+	s1, _, _ := startServer(t, ctx, controlURL, "s1")
+
+	addr1, proxyCred1, localAPICred1, err := s1.Loopback()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// NOVA_MOD: simulate iOS invalidating the loopback mux listener while the
+	// app is backgrounded, without clearing tsnet's cached listener state.
+	if err := s1.loopbackListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	addr2, proxyCred2, localAPICred2, restarted, err := s1.RestartLoopbackIfNeeded()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted {
+		t.Fatal("RestartLoopbackIfNeeded reported no restart after loopback listener was closed")
+	}
+	if proxyCred1 != proxyCred2 {
+		t.Fatal("proxy credentials changed across loopback restart")
+	}
+	if localAPICred1 != localAPICred2 {
+		t.Fatal("local API credentials changed across loopback restart")
+	}
+	if addr1 != addr2 {
+		t.Fatalf("loopback listener restarted on %q; want previous address %q", addr2, addr1)
+	}
+
+	url := "http://" + addr2 + "/localapi/v0/status"
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Sec-Tailscale", "localapi")
+	req.SetBasicAuth("", localAPICred2)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("GET /status after restart returned %d, want 200", res.StatusCode)
+	}
+}
+
+// NOVA_MOD: add test for restart loopback listener.
+func TestCloseClearsLoopbackState(t *testing.T) {
+	tstest.Shard(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	controlURL, _ := startControl(t)
+	s1, _, _ := startServer(t, ctx, controlURL, "s1")
+
+	if _, _, _, err := s1.Loopback(); err != nil {
+		t.Fatal(err)
+	}
+	if s1.loopbackListener == nil {
+		t.Fatal("loopback listener not initialized")
+	}
+	if s1.loopbackAddr == "" {
+		t.Fatal("loopback address not recorded")
+	}
+	if s1.proxyCred == "" || s1.localAPICred == "" {
+		t.Fatal("loopback credentials not recorded")
+	}
+
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s1.loopbackListener != nil {
+		t.Fatal("loopback listener not cleared on close")
+	}
+	if s1.loopbackAddr != "" {
+		t.Fatal("loopback address not cleared on close")
+	}
+	if s1.proxyCred != "" || s1.localAPICred != "" {
+		t.Fatal("loopback credentials not cleared on close")
+	}
+}
+
 func TestLoopbackSOCKS5(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/8198")
 	tstest.Shard(t)

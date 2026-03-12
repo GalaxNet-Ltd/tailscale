@@ -181,6 +181,7 @@ type Server struct {
 	shutdownCancel       context.CancelFunc
 	proxyCred            string        // SOCKS5 proxy auth for loopbackListener
 	localAPICred         string        // basic auth password for loopbackListener
+	loopbackAddr         string        // NOVA_MOD: last requested loopback bind address for listener recovery
 	loopbackListener     net.Listener  // optional loopback for localapi and proxies
 	localAPIListener     net.Listener  // in-memory, used by localClient
 	localClient          *local.Client // in-memory
@@ -293,65 +294,148 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		return "", "", "", err
 	}
 
-	if s.loopbackListener == nil {
-		var proxyCred [16]byte
-		if _, err := crand.Read(proxyCred[:]); err != nil {
-			return "", "", "", err
-		}
-		s.proxyCred = hex.EncodeToString(proxyCred[:])
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		var cred [16]byte
-		if _, err := crand.Read(cred[:]); err != nil {
-			return "", "", "", err
-		}
-		s.localAPICred = hex.EncodeToString(cred[:])
+	// NOVA_MOD: adapt to change because we add restart loopback if needed interface.
+	if err := s.ensureLoopbackListenerLocked("127.0.0.1:0"); err != nil {
+		return "", "", "", err
+	}
+	return s.loopbackListenerAddrLocked(), s.proxyCred, s.localAPICred, nil
+}
 
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return "", "", "", err
-		}
-		s.loopbackListener = ln
-
-		socksLn, httpLn := proxymux.SplitSOCKSAndHTTP(ln)
-
-		// TODO: add HTTP proxy support. Probably requires factoring
-		// out the CONNECT code from tailscaled/proxy.go that uses
-		// httputil.ReverseProxy and adding auth support.
-		go func() {
-			lah := localapi.NewHandler(localapi.HandlerConfig{
-				Actor:    ipnauth.Self,
-				Backend:  s.lb,
-				Logf:     s.logf,
-				LogID:    s.logid,
-				EventBus: s.sys.Bus.Get(),
-			})
-			lah.PermitWrite = true
-			lah.PermitRead = true
-			lah.RequiredPassword = s.localAPICred
-			h := &localSecHandler{h: lah, cred: s.localAPICred}
-
-			if err := http.Serve(httpLn, h); err != nil {
-				s.logf("localapi tcp serve error: %v", err)
-			}
-		}()
-		s5l := logger.WithPrefix(s.logf, "socks5: ")
-		s5s := &socks5.Server{
-			Logf:     s5l,
-			Dialer:   s.dialer.UserDial,
-			Username: "tsnet",
-			Password: s.proxyCred,
-		}
-		go func() {
-			s5l("SOCKS5 server exited: %v", s5s.Serve(socksLn))
-		}()
+// NOVA_MOD: add interfaces to fix app goes background and back for long and cause loopback
+// BEGIN: multiple functions added follows.
+func (s *Server) RestartLoopbackIfNeeded() (addr string, proxyCred, localAPICred string, restarted bool, err error) {
+	if err := s.Start(); err != nil {
+		return "", "", "", false, err
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// reuse the current port when the socket survived backgrounding.
+	if s.loopbackListener != nil && s.loopbackListenerAliveLocked() {
+		return s.loopbackListenerAddrLocked(), s.proxyCred, s.localAPICred, false, nil
+	}
+
+	// refresh proxy settings when the original port can no longer be reclaimed.
+	if err := s.ensureLoopbackListenerLocked(s.loopbackAddr); err != nil {
+		if s.loopbackAddr == "127.0.0.1:0" || s.loopbackAddr == "" {
+			return "", "", "", false, err
+		}
+		if err := s.ensureLoopbackListenerLocked("127.0.0.1:0"); err != nil {
+			return "", "", "", false, err
+		}
+	}
+	return s.loopbackListenerAddrLocked(), s.proxyCred, s.localAPICred, true, nil
+}
+
+func (s *Server) ensureLoopbackListenerLocked(listenAddr string) error {
+	if err := s.initLoopbackCredsLocked(); err != nil {
+		return err
+	}
+
+	if s.loopbackListener != nil {
+		return nil
+	}
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:0"
+	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	s.installLoopbackListenerLocked(ln)
+	return nil
+}
+
+func (s *Server) initLoopbackCredsLocked() error {
+	if s.proxyCred == "" {
+		var proxyCred [16]byte
+		if _, err := crand.Read(proxyCred[:]); err != nil {
+			return err
+		}
+		s.proxyCred = hex.EncodeToString(proxyCred[:])
+	}
+	if s.localAPICred == "" {
+		var cred [16]byte
+		if _, err := crand.Read(cred[:]); err != nil {
+			return err
+		}
+		s.localAPICred = hex.EncodeToString(cred[:])
+	}
+	return nil
+}
+
+func (s *Server) installLoopbackListenerLocked(ln net.Listener) {
+	// to reclaim the previous mux port before falling back to a new one.
+	s.loopbackListener = ln
+	s.loopbackAddr = ln.Addr().String()
+
+	socksLn, httpLn := proxymux.SplitSOCKSAndHTTP(ln)
+
+	// TODO: add HTTP proxy support. Probably requires factoring
+	// out the CONNECT code from tailscaled/proxy.go that uses
+	// httputil.ReverseProxy and adding auth support.
+	go func() {
+		lah := localapi.NewHandler(localapi.HandlerConfig{
+			Actor:    ipnauth.Self,
+			Backend:  s.lb,
+			Logf:     s.logf,
+			LogID:    s.logid,
+			EventBus: s.sys.Bus.Get(),
+		})
+		lah.PermitWrite = true
+		lah.PermitRead = true
+		lah.RequiredPassword = s.localAPICred
+		h := &localSecHandler{h: lah, cred: s.localAPICred}
+
+		if err := http.Serve(httpLn, h); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.logf("localapi tcp serve error: %v", err)
+		}
+	}()
+	s5l := logger.WithPrefix(s.logf, "socks5: ")
+	s5s := &socks5.Server{
+		Logf:     s5l,
+		Dialer:   s.dialer.UserDial,
+		Username: "tsnet",
+		Password: s.proxyCred,
+	}
+	go func() {
+		if err := s5s.Serve(socksLn); err != nil && !errors.Is(err, net.ErrClosed) {
+			s5l("SOCKS5 server exited: %v", err)
+		}
+	}()
+}
+
+func (s *Server) loopbackListenerAliveLocked() bool {
+	addr := s.loopbackListenerAddrLocked()
+	conn, err := (&net.Dialer{Timeout: 250 * time.Millisecond}).Dial("tcp", addr)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+
+	// the mux listener after iOS has invalidated the original socket.
+	if s.loopbackListener != nil {
+		s.loopbackListener.Close()
+		s.loopbackListener = nil
+	}
+	return false
+}
+
+// END: multipole function added in the above block.
+// NOVA_MOD:
+
+func (s *Server) loopbackListenerAddrLocked() string {
 	lbAddr := s.loopbackListener.Addr()
 	if lbAddr == nil {
 		// https://github.com/tailscale/tailscale/issues/7488
 		panic("loopbackListener has no Addr")
 	}
-	return lbAddr.String(), s.proxyCred, s.localAPICred, nil
+	return lbAddr.String()
 }
 
 type localSecHandler struct {
@@ -480,10 +564,17 @@ func (s *Server) Close() error {
 	}
 	if s.localAPIListener != nil {
 		s.localAPIListener.Close()
+		s.localAPIListener = nil // NOVA_MOD: clear closed in-memory LocalAPI listener during shutdown.
 	}
 	if s.loopbackListener != nil {
 		s.loopbackListener.Close()
+		s.loopbackListener = nil // NOVA_MOD: clear loopback listener so tailnet switches cannot retain stale state.
 	}
+	s.loopbackAddr = ""    // NOVA_MOD: forget the previous loopback bind address once the server is closed.
+	s.proxyCred = ""       // NOVA_MOD: drop loopback proxy credentials on shutdown.
+	s.localAPICred = ""    // NOVA_MOD: drop LocalAPI credentials on shutdown.
+	s.localClient = nil    // NOVA_MOD: release LocalClient references on shutdown.
+	s.localAPIServer = nil // NOVA_MOD: release HTTP server references on shutdown.
 
 	for _, ln := range s.listeners {
 		ln.closeLocked()
