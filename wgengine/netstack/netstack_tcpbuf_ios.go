@@ -16,9 +16,13 @@ const (
 	// TODO(jwhited): test memory/throughput impact of collapsing to values in _default.go
 	tcpRXBufMinSize = tcp.MinBufferSize
 	tcpRXBufDefSize = tcp.DefaultSendBufferSize
-	tcpRXBufMaxSize = tcp.MaxBufferSize
+	// NOVA_MOD: use default value becase Nova is not in NE
+	// tcpRXBufMaxSize = tcp.MaxBufferSize
+	tcpRXBufMaxSize = 8 << 20 // 8MiB
 
 	tcpTXBufMinSize = tcp.MinBufferSize
 	tcpTXBufDefSize = tcp.DefaultReceiveBufferSize
-	tcpTXBufMaxSize = tcp.MaxBufferSize
+	// NOVA_MOD: use default value becase Nova is not in NE
+	// tcpTXBufMaxSize = tcp.MaxBufferSize
+	tcpTXBufMaxSize = 6 << 20 // 6MiB
 )
