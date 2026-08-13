@@ -119,6 +119,26 @@ func TestNewDirect(t *testing.T) {
 	}
 }
 
+func TestIsTailscaleHostedControlURL(t *testing.T) {
+	for _, tt := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://controlplane.tailscale.com", true},
+		{"https://login.tailscale.com", true},
+		{"https://login.us.tailscale.com", true},
+		{"https://LOGIN.US.TAILSCALE.COM.:443/path", true},
+		{"https://tailscale.com", true},
+		{"https://login.xedge.cc", false},
+		{"https://login.tailscale.com.example.com", false},
+		{"not a URL", false},
+	} {
+		if got := isTailscaleHostedControlURL(tt.url); got != tt.want {
+			t.Errorf("isTailscaleHostedControlURL(%q) = %v, want %v", tt.url, got, tt.want)
+		}
+	}
+}
+
 func fakeEndpoints(ports ...uint16) (ret []tailcfg.Endpoint) {
 	for _, port := range ports {
 		ret = append(ret, tailcfg.Endpoint{

@@ -47,7 +47,26 @@ func MakeLookupFuncWithPhysicalDNS(logf logger.Logf, netMon *netmon.Monitor) fun
 		logf = logger.Discard
 	}
 	bootstrap := lookupFunc(MakeLookupFunc(logf, netMon))
-	physical := func(ctx context.Context, host string) ([]netip.Addr, error) {
+	physical := makePhysicalDNSLookupFunc(logf, netMon)
+	return makeLookupFuncWithPhysicalDNS(logf, bootstrap, physical)
+}
+
+// MakePhysicalDNSLookupFunc returns a classic DNS lookup function that skips
+// DERP bootstrap DNS. It is intended for a configured custom control server:
+// Tailscale's embedded DERPs only publish Tailscale-operated control names.
+//
+// DNS is sent over the physical network, trying UDP before TCP. Callers should
+// not use this for Tailscale-operated control names or for DERP hostnames,
+// where the normal bootstrap-first policy remains useful.
+func MakePhysicalDNSLookupFunc(logf logger.Logf, netMon *netmon.Monitor) func(context.Context, string) ([]netip.Addr, error) {
+	if logf == nil {
+		logf = logger.Discard
+	}
+	return makePhysicalDNSOnlyLookupFunc(logf, makePhysicalDNSLookupFunc(logf, netMon))
+}
+
+func makePhysicalDNSLookupFunc(logf logger.Logf, netMon *netmon.Monitor) lookupFunc {
+	return func(ctx context.Context, host string) ([]netip.Addr, error) {
 		if netMon == nil {
 			return nil, errors.New("physical DNS requires a network monitor")
 		}
@@ -57,7 +76,25 @@ func MakeLookupFuncWithPhysicalDNS(logf logger.Logf, netMon *netmon.Monitor) fun
 		dialer := netns.NewDialer(logf, netMon)
 		return lookupPhysicalDNS(ctx, host, logf, dialer.DialContext)
 	}
-	return makeLookupFuncWithPhysicalDNS(logf, bootstrap, physical)
+}
+
+func makePhysicalDNSOnlyLookupFunc(logf logger.Logf, physical lookupFunc) lookupFunc {
+	if logf == nil {
+		logf = logger.Discard
+	}
+	return func(ctx context.Context, host string) ([]netip.Addr, error) {
+		logf("dnsfallback: DERP bootstrap DNS skipped for custom control host %q; trying physical UDP/TCP DNS", host)
+		ips, err := physical(ctx, host)
+		ips = filterUsableIPs(ips)
+		if len(ips) != 0 {
+			return ips, nil
+		}
+		if err == nil {
+			err = errors.New("physical DNS returned no usable IPs")
+		}
+		logf("dnsfallback: physical UDP/TCP DNS failed for %q: %v", host, err)
+		return nil, fmt.Errorf("physical DNS failed: %w", err)
+	}
 }
 
 func makeLookupFuncWithPhysicalDNS(logf logger.Logf, bootstrap, physical lookupFunc) lookupFunc {

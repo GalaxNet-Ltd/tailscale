@@ -616,22 +616,42 @@ func (d *Dialer) PeerAPITransport() *http.Transport {
 	return d.PeerAPIHTTPClient().Transport.(*http.Transport)
 }
 
-// NewControlPlaneDNSResolver returns a resolver for control and DERP
-// hostnames. It rejects synthetic DNS addresses before they can be cached or
-// dialed, then tries the existing DERP bootstrap resolver followed by classic
-// DNS over the physical network.
+// ControlPlaneDNSResolverOptions configures
+// NewControlPlaneDNSResolverWithOptions.
+type ControlPlaneDNSResolverOptions struct {
+	// SkipDERPBootstrap skips Tailscale's DERP /bootstrap-dns fallback and
+	// proceeds directly to classic DNS over the physical network. Set this
+	// only for a configured custom control server; keep it false for DERP
+	// hostnames and Tailscale-operated control servers.
+	SkipDERPBootstrap bool
+}
+
+// NewControlPlaneDNSResolver returns a resolver for control and DERP hostnames
+// using the default bootstrap-first fallback policy.
 //
 // The returned Resolver is independent and safe for concurrent use.
 func (d *Dialer) NewControlPlaneDNSResolver(logf logger.Logf) *dnscache.Resolver {
+	return d.NewControlPlaneDNSResolverWithOptions(logf, ControlPlaneDNSResolverOptions{})
+}
+
+// NewControlPlaneDNSResolverWithOptions is like
+// NewControlPlaneDNSResolver, with additional fallback policy options.
+func (d *Dialer) NewControlPlaneDNSResolverWithOptions(logf logger.Logf, opts ControlPlaneDNSResolverOptions) *dnscache.Resolver {
 	if logf == nil {
 		logf = d.Logf
 	}
+	fallback := dnsfallback.MakeLookupFuncWithPhysicalDNS(logf, d.NetMon())
+	fallbackOrder := "DERP bootstrap then physical UDP/TCP"
+	if opts.SkipDERPBootstrap {
+		fallback = dnsfallback.MakePhysicalDNSLookupFunc(logf, d.NetMon())
+		fallbackOrder = "physical UDP/TCP (DERP bootstrap skipped for custom control server)"
+	}
 	if logf != nil {
-		logf("dnsfallback: control-plane DNS safeguard enabled; rejecting 198.18.0.0/15, fallback order: DERP bootstrap then physical UDP/TCP")
+		logf("dnsfallback: control-plane DNS safeguard enabled; rejecting 198.18.0.0/15, fallback order: %s", fallbackOrder)
 	}
 	return &dnscache.Resolver{
 		Forward:          dnscache.Get().Forward,
-		LookupIPFallback: dnsfallback.MakeLookupFuncWithPhysicalDNS(logf, d.NetMon()),
+		LookupIPFallback: fallback,
 		UseLastGood:      true,
 		ForwardTimeout:   2 * time.Second,
 		RejectIP:         tsaddr.IsSyntheticDNSIP,

@@ -111,6 +111,30 @@ func TestLookupWithPhysicalDNSFallback(t *testing.T) {
 	})
 }
 
+func TestPhysicalDNSOnlyLookup(t *testing.T) {
+	real := netip.MustParseAddr("203.0.113.10")
+	physicalCalls := 0
+	var logs strings.Builder
+	lookup := makePhysicalDNSOnlyLookupFunc(
+		func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) },
+		func(context.Context, string) ([]netip.Addr, error) {
+			physicalCalls++
+			return []netip.Addr{netip.MustParseAddr("198.18.1.2"), real}, nil
+		},
+	)
+
+	ips, err := lookup(context.Background(), "login.custom.example")
+	if err != nil || len(ips) != 1 || ips[0] != real {
+		t.Fatalf("lookup = %v, %v; want only %v", ips, err, real)
+	}
+	if physicalCalls != 1 {
+		t.Fatalf("physical calls = %d; want 1", physicalCalls)
+	}
+	if got := logs.String(); !strings.Contains(got, `DERP bootstrap DNS skipped for custom control host "login.custom.example"`) {
+		t.Fatalf("missing always-on bootstrap-skip log in %q", got)
+	}
+}
+
 func TestPhysicalDNSRetriesTCP(t *testing.T) {
 	real := netip.MustParseAddr("203.0.113.10")
 	var mu sync.Mutex

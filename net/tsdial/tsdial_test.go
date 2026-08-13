@@ -39,6 +39,17 @@ func TestNewControlPlaneDNSResolver(t *testing.T) {
 	if got := logs.String(); !strings.Contains(got, "control-plane DNS safeguard enabled") {
 		t.Fatalf("missing always-on safeguard log in %q", got)
 	}
+	if got := logs.String(); !strings.Contains(got, "DERP bootstrap then physical UDP/TCP") {
+		t.Fatalf("missing bootstrap-first policy log in %q", got)
+	}
+
+	logs.Reset()
+	d.NewControlPlaneDNSResolverWithOptions(func(format string, args ...any) {
+		fmt.Fprintf(&logs, format, args...)
+	}, ControlPlaneDNSResolverOptions{SkipDERPBootstrap: true})
+	if got := logs.String(); !strings.Contains(got, "DERP bootstrap skipped for custom control server") {
+		t.Fatalf("missing custom-control policy log in %q", got)
+	}
 }
 
 func TestUserDialPlan(t *testing.T) {

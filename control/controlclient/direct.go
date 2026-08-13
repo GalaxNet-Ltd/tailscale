@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -278,7 +279,9 @@ func NewDirect(opts Options) (*Direct, error) {
 		opts.Logf = log.Printf
 	}
 
-	dnsCache := opts.Dialer.NewControlPlaneDNSResolver(opts.Logf)
+	dnsCache := opts.Dialer.NewControlPlaneDNSResolverWithOptions(opts.Logf, tsdial.ControlPlaneDNSResolverOptions{
+		SkipDERPBootstrap: !isTailscaleHostedControlURL(opts.ServerURL),
+	})
 
 	httpc := opts.HTTPTestClient
 	if httpc == nil && runtime.GOOS == "js" {
@@ -400,6 +403,20 @@ func NewDirect(opts Options) (*Direct, error) {
 	})
 
 	return c, nil
+}
+
+// isTailscaleHostedControlURL reports whether rawURL names a control server
+// hosted under tailscale.com. Official DERP bootstrap DNS publishes
+// Tailscale-operated control names, but cannot resolve arbitrary self-hosted
+// control names. Be conservative for future regional Tailscale hostnames by
+// accepting the entire tailscale.com DNS suffix.
+func isTailscaleHostedControlURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	return host == "tailscale.com" || strings.HasSuffix(host, ".tailscale.com")
 }
 
 // Close closes the underlying Noise connection(s).
