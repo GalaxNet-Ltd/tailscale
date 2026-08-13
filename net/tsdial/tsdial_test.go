@@ -5,11 +5,41 @@ package tsdial
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gaissmai/bart"
+	"tailscale.com/net/netmon"
 )
+
+func TestNewControlPlaneDNSResolver(t *testing.T) {
+	d := NewDialer(netmon.NewStatic())
+	var logs strings.Builder
+	r := d.NewControlPlaneDNSResolver(func(format string, args ...any) {
+		fmt.Fprintf(&logs, format, args...)
+	})
+	if r.LookupIPFallback == nil {
+		t.Fatal("LookupIPFallback is nil")
+	}
+	if !r.UseLastGood {
+		t.Fatal("UseLastGood is false")
+	}
+	if r.ForwardTimeout != 2*time.Second {
+		t.Fatalf("ForwardTimeout = %v; want 2s", r.ForwardTimeout)
+	}
+	if r.RejectIP == nil || !r.RejectIP(netip.MustParseAddr("198.18.1.2")) {
+		t.Fatal("resolver does not reject synthetic DNS IP")
+	}
+	if r.RejectIP(netip.MustParseAddr("203.0.113.10")) {
+		t.Fatal("resolver rejects non-synthetic IP")
+	}
+	if got := logs.String(); !strings.Contains(got, "control-plane DNS safeguard enabled") {
+		t.Fatalf("missing always-on safeguard log in %q", got)
+	}
+}
 
 func TestUserDialPlan(t *testing.T) {
 	tests := []struct {

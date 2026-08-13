@@ -36,12 +36,13 @@ func CGNATRange() netip.Prefix {
 }
 
 var (
-	cgnatRange   oncePrefix
-	tsUlaRange   oncePrefix
-	tsViaRange   oncePrefix
-	ula4To6Range oncePrefix
-	ulaEph6Range oncePrefix
-	serviceIPv6  oncePrefix
+	cgnatRange        oncePrefix
+	syntheticDNSRange oncePrefix
+	tsUlaRange        oncePrefix
+	tsViaRange        oncePrefix
+	ula4To6Range      oncePrefix
+	ulaEph6Range      oncePrefix
+	serviceIPv6       oncePrefix
 )
 
 // TailscaleServiceIP returns the IPv4 listen address of services
@@ -79,6 +80,15 @@ func IsTailscaleIP(ip netip.Addr) bool {
 // Tailscale assigns from.
 func IsTailscaleIPv4(ip netip.Addr) bool {
 	return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
+}
+
+// IsSyntheticDNSIP reports whether ip is in 198.18.0.0/15, the benchmarking
+// range used by some VPN DNS proxies for synthetic ("fake IP") answers.
+//
+// An IPv4-mapped IPv6 address is treated the same as its IPv4 address.
+func IsSyntheticDNSIP(ip netip.Addr) bool {
+	syntheticDNSRange.Do(func() { mustPrefix(&syntheticDNSRange.v, "198.18.0.0/15") })
+	return syntheticDNSRange.v.Contains(ip.Unmap())
 }
 
 // TailscaleULARange returns the IPv6 Unique Local Address range that

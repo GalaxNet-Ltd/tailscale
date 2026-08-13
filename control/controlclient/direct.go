@@ -41,7 +41,6 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/logtail"
 	"tailscale.com/net/dnscache"
-	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
@@ -279,12 +278,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		opts.Logf = log.Printf
 	}
 
-	dnsCache := &dnscache.Resolver{
-		Forward:          dnscache.Get().Forward, // use default cache's forwarder
-		UseLastGood:      true,
-		LookupIPFallback: dnsfallback.MakeLookupFunc(opts.Logf, netMon),
-		Logf:             opts.Logf,
-	}
+	dnsCache := opts.Dialer.NewControlPlaneDNSResolver(opts.Logf)
 
 	httpc := opts.HTTPTestClient
 	if httpc == nil && runtime.GOOS == "js" {

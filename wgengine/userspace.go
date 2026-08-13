@@ -435,6 +435,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		DERPActiveFunc: e.RequestStatus,
 		IdleFunc:       e.tundev.IdleDuration,
 		NetMon:         e.netMon,
+		DNSCache:       conf.Dialer.NewControlPlaneDNSResolver(logf),
 		HealthTracker:  e.health,
 		ExtraRootCAs:   conf.ExtraRootCAs,
 		Metrics:        conf.Metrics,

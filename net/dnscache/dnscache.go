@@ -82,6 +82,16 @@ type Resolver struct {
 	// if a refresh fails.
 	UseLastGood bool
 
+	// ForwardTimeout, if non-zero, is the maximum time spent consulting
+	// Forward before trying LookupIPFallback. If zero, a default is used.
+	ForwardTimeout time.Duration
+
+	// RejectIP, if non-nil, is called for each normalized IP address returned
+	// by Forward and LookupIPFallback. Addresses for which RejectIP returns
+	// true are neither returned nor cached. If all answers are rejected, the
+	// lookup is treated as a failure so LookupIPFallback can run.
+	RejectIP func(netip.Addr) bool
+
 	// SingleHostStaticResult, if non-nil, is the static result of IPs that is returned
 	// by Resolver.LookupIP for any hostname. When non-nil, SingleHost must also be
 	// set with the expected name.
@@ -91,9 +101,10 @@ type Resolver struct {
 	// It is required when SingleHostStaticResult is present.
 	SingleHost string
 
-	// Logf optionally provides a log function to use for debug logs. If
-	// not present, log.Printf will be used. The prefix "dnscache: " will
-	// be added to all log messages printed with this logger.
+	// Logf optionally provides a log function to use for resolver logs. If
+	// not present, log.Printf will be used. Most routine logs are debug-only,
+	// while unusual events such as rejected answers are always logged. The
+	// prefix "dnscache: " is added to every message.
 	Logf logger.Logf
 
 	sf singleflight.Group[string, ipRes]
@@ -134,6 +145,17 @@ func (r *Resolver) dlogf(format string, args ...any) {
 	if debug() || debugLogging.Load() {
 		logf("dnscache: "+format, args...)
 	}
+}
+
+// logf writes an always-on resolver log. It is reserved for unusual events
+// that need to be visible without TS_DEBUG_DNS_CACHE, such as rejecting a
+// synthetic DNS answer or changing fallback mechanisms.
+func (r *Resolver) logf(format string, args ...any) {
+	logf := r.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	logf("dnscache: "+format, args...)
 }
 
 // cloudHostResolver returns a Resolver for the current cloud hosting environment.
@@ -269,6 +291,9 @@ func (r *Resolver) lookupIPCacheExpired(host string) (ip, ip6 netip.Addr, allIPs
 }
 
 func (r *Resolver) lookupTimeoutForHost(host string) time.Duration {
+	if r.ForwardTimeout > 0 {
+		return r.ForwardTimeout
+	}
 	if r.UseLastGood {
 		if _, _, _, ok := r.lookupIPCacheExpired(host); ok {
 			// If we have some previous good value for this host,
@@ -283,6 +308,41 @@ func (r *Resolver) lookupTimeoutForHost(host string) time.Duration {
 		}
 	}
 	return 10 * time.Second
+}
+
+// filterIPs normalizes ips and removes any address rejected by r.RejectIP.
+// Rejections are logged unconditionally so callers using an external log sink
+// can diagnose why the resolver changed paths.
+func (r *Resolver) filterIPs(host, source string, ips []netip.Addr) []netip.Addr {
+	if len(ips) == 0 {
+		return ips
+	}
+	filtered := ips[:0]
+	var rejected []netip.Addr
+	for _, ip := range ips {
+		ip = ip.Unmap()
+		if r.RejectIP != nil && r.RejectIP(ip) {
+			rejected = append(rejected, ip)
+			continue
+		}
+		filtered = append(filtered, ip)
+	}
+	if len(rejected) != 0 {
+		r.logf("rejected %s DNS answer for %q containing synthetic IPs %v", source, host, rejected)
+	}
+	return filtered
+}
+
+func (r *Resolver) lookupFallback(ctx context.Context, host string) ([]netip.Addr, error) {
+	ips, err := r.LookupIPFallback(ctx, host)
+	ips = r.filterIPs(host, "fallback", ips)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("fallback returned no usable IPs for %q", host)
+	}
+	return ips, nil
 }
 
 func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Addr, allIPs []netip.Addr, err error) {
@@ -300,10 +360,12 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 	} else {
 		ips, err = r.fwd().LookupNetIP(lookupCtx, "ip", host)
 	}
+	ips = r.filterIPs(host, "forward", ips)
 	if err != nil || len(ips) == 0 {
 		if resolver, ok := r.cloudHostResolver(); ok {
 			r.dlogf("resolving %q via cloud resolver", host)
 			ips, err = resolver.LookupNetIP(lookupCtx, "ip", host)
+			ips = r.filterIPs(host, "cloud", ips)
 		}
 	}
 	if (err != nil || len(ips) == 0) && r.LookupIPFallback != nil {
@@ -314,7 +376,7 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 		} else {
 			r.dlogf("resolving %q using fallback resolver due to no returned IPs", host)
 		}
-		ips, err = r.LookupIPFallback(lookupCtx, host)
+		ips, err = r.lookupFallback(lookupCtx, host)
 	}
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, nil, err
@@ -323,7 +385,9 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 		return netip.Addr{}, netip.Addr{}, nil, fmt.Errorf("no IPs for %q found", host)
 	}
 
-	// Unmap everything; LookupNetIP can return mapped addresses (see #5698)
+	// Unmap everything; LookupNetIP can return mapped addresses (see #5698).
+	// filterIPs normally already did this, but retain this for defensive
+	// normalization if the lookup flow changes.
 	for i := range ips {
 		ips[i] = ips[i].Unmap()
 	}
@@ -410,7 +474,7 @@ func (d *dialer) DialContext(ctx context.Context, network, address string) (retC
 		if !d.shouldTryBootstrap(ctx, ret, dc) {
 			return
 		}
-		ips, err := d.dnsCache.LookupIPFallback(ctx, host)
+		ips, err := d.dnsCache.lookupFallback(ctx, host)
 		if err != nil {
 			// Return with original error
 			return

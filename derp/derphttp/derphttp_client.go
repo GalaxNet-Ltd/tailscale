@@ -11,7 +11,6 @@ package derphttp
 
 import (
 	"bufio"
-	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -705,16 +704,51 @@ func (c *Client) dialContext(ctx context.Context, proto, addr string) (net.Conn,
 	return netns.NewDialer(c.logf, c.netMon).DialContext(ctx, proto, addr)
 }
 
-// shouldDialProto reports whether an explicitly provided IPv4 or IPv6
-// address (given in s) is valid. An empty value means to dial, but to
-// use DNS. The predicate function reports whether the non-empty
-// string s contained a valid IP address of the right family.
-func shouldDialProto(s string, pred func(netip.Addr) bool) bool {
-	if s == "" {
-		return true
+type nodeDialTarget struct {
+	addr    string
+	network string
+}
+
+// nodeDialTargets returns literal address targets for any DERP address family
+// that needs DNS when c has a DNSCache. Explicit IPv4 and IPv6 values retain
+// their existing behavior, including invalid values such as "none" disabling
+// that family.
+func (c *Client) nodeDialTargets(ctx context.Context, n *tailcfg.DERPNode) ([]nodeDialTarget, error) {
+	var resolved []netip.Addr
+	var resolveErr error
+	needsDNS := n.IPv4 == "" || n.IPv6 == ""
+	if needsDNS && c.DNSCache != nil {
+		_, _, resolved, resolveErr = c.DNSCache.LookupIP(ctx, n.HostName)
 	}
-	ip, _ := netip.ParseAddr(s)
-	return pred(ip)
+
+	var targets []nodeDialTarget
+	addFamily := func(configured, network string, matches func(netip.Addr) bool) {
+		if configured != "" {
+			if ip, err := netip.ParseAddr(configured); err == nil && matches(ip) {
+				targets = append(targets, nodeDialTarget{addr: ip.String(), network: network})
+			}
+			return
+		}
+		if c.DNSCache == nil {
+			targets = append(targets, nodeDialTarget{addr: n.HostName, network: network})
+			return
+		}
+		for _, ip := range resolved {
+			if matches(ip) {
+				targets = append(targets, nodeDialTarget{addr: ip.String(), network: network})
+			}
+		}
+	}
+	addFamily(n.IPv4, "tcp4", netip.Addr.Is4)
+	addFamily(n.IPv6, "tcp6", netip.Addr.Is6)
+
+	if len(targets) != 0 {
+		return targets, nil
+	}
+	if resolveErr != nil {
+		return nil, fmt.Errorf("resolving DERP node %q: %w", n.HostName, resolveErr)
+	}
+	return nil, errors.New("both IPv4 and IPv6 are explicitly disabled or DNS returned no matching addresses")
 }
 
 const dialNodeTimeout = 1500 * time.Millisecond
@@ -743,6 +777,11 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 		}
 	}
 
+	targets, err := c.nodeDialTargets(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+
 	type res struct {
 		c   net.Conn
 		err error
@@ -754,18 +793,7 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
 
 	nwait := 0
-	startDial := func(dstPrimary, proto string) {
-		dst := cmp.Or(dstPrimary, n.HostName)
-
-		// If dialing an IP address directly, check its address family
-		// and bail out before incrementing nwait.
-		if ip, err := netip.ParseAddr(dst); err == nil {
-			if proto == "tcp4" && ip.Is6() ||
-				proto == "tcp6" && ip.Is4() {
-				return
-			}
-		}
-
+	startDial := func(dst, proto string) {
 		nwait++
 		go func() {
 			if proto == "tcp4" && c.preferIPv6() {
@@ -797,11 +825,8 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			}
 		}()
 	}
-	if shouldDialProto(n.IPv4, netip.Addr.Is4) {
-		startDial(n.IPv4, "tcp4")
-	}
-	if shouldDialProto(n.IPv6, netip.Addr.Is6) {
-		startDial(n.IPv6, "tcp6")
+	for _, target := range targets {
+		startDial(target.addr, target.network)
 	}
 	if nwait == 0 {
 		return nil, errors.New("both IPv4 and IPv6 are explicitly disabled for node")

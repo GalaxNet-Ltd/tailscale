@@ -38,6 +38,7 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/batching"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
@@ -166,6 +167,7 @@ type Conn struct {
 	testOnlyPacketListener nettype.PacketListener
 	onDERPRecv             func(int, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
 	netMon                 *netmon.Monitor                        // must be non-nil
+	dnsCache               *dnscache.Resolver                     // must be non-nil
 	health                 *health.Tracker                        // or nil
 	extraRootCAs           *x509.CertPool                         // additional trusted root CAs; or nil
 	controlKnobs           *controlknobs.Knobs                    // or nil
@@ -460,6 +462,10 @@ type Options struct {
 	// It must be non-nil.
 	NetMon *netmon.Monitor
 
+	// DNSCache is the resolver to use for control-plane DERP hostnames.
+	// If nil, the package-global dnscache resolver is used.
+	DNSCache *dnscache.Resolver
+
 	// HealthTracker optionally specifies the health tracker to
 	// report errors and warnings to.
 	HealthTracker *health.Tracker
@@ -672,6 +678,10 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.netMon = opts.NetMon
+	c.dnsCache = opts.DNSCache
+	if c.dnsCache == nil {
+		c.dnsCache = dnscache.Get()
+	}
 	c.health = opts.HealthTracker
 	c.extraRootCAs = opts.ExtraRootCAs
 	c.getPeerByKey = opts.PeerByKeyFunc
@@ -687,6 +697,7 @@ func NewConn(opts Options) (*Conn, error) {
 		SkipExternalNetwork: inTest(),
 		PortMapper:          c.portMapper,
 		UseDNSCache:         true,
+		DNSCache:            c.dnsCache,
 	}
 
 	c.metrics = registerMetrics(opts.Metrics)

@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"tailscale.com/derp"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun/stuntest"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/nettest"
 )
@@ -1006,6 +1008,41 @@ func TestNodeAddrResolve(t *testing.T) {
 				t.Logf("correctly got invalid addr")
 			})
 		})
+	}
+}
+
+func TestNodeAddrResolveUsesInjectedDNSCache(t *testing.T) {
+	synthetic := netip.MustParseAddr("198.18.1.2")
+	real := netip.MustParseAddr("203.0.113.10")
+	fallbackCalls := 0
+	c := &Client{
+		Logf:        t.Logf,
+		UseDNSCache: true,
+		DNSCache: &dnscache.Resolver{
+			Logf:     t.Logf,
+			RejectIP: tsaddr.IsSyntheticDNSIP,
+			LookupIPForTest: func(context.Context, string) ([]netip.Addr, error) {
+				return []netip.Addr{synthetic}, nil
+			},
+			LookupIPFallback: func(context.Context, string) ([]netip.Addr, error) {
+				fallbackCalls++
+				return []netip.Addr{real}, nil
+			},
+		},
+	}
+	n := &tailcfg.DERPNode{
+		Name:     "custom-derp",
+		RegionID: 901,
+		HostName: "derp.example",
+	}
+
+	got, ok := c.nodeAddrPort(context.Background(), n, 3478, probeIPv4)
+	want := netip.AddrPortFrom(real, 3478)
+	if !ok || got != want {
+		t.Fatalf("nodeAddrPort = %v, %v; want %v, true", got, ok, want)
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback calls = %d; want 1", fallbackCalls)
 	}
 }
 

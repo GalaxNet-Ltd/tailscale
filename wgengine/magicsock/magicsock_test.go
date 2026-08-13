@@ -45,6 +45,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netmon"
@@ -434,12 +435,14 @@ func TestNewConn(t *testing.T) {
 	// Use port 0 to let the system assign a port, avoiding TOCTOU races
 	// from the previous pickPort approach which would close a socket and
 	// hope to rebind to the same port.
+	dnsCache := new(dnscache.Resolver)
 	conn, err := NewConn(Options{
 		Port:              0,
 		DisablePortMapper: true,
 		EndpointsFunc:     epFunc,
 		Logf:              t.Logf,
 		NetMon:            netMon,
+		DNSCache:          dnsCache,
 		EventBus:          bus,
 		Metrics:           new(usermetric.Registry),
 	})
@@ -447,6 +450,9 @@ func TestNewConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	if conn.dnsCache != dnsCache || conn.netChecker.DNSCache != dnsCache {
+		t.Fatal("custom DNS cache was not propagated to DERP and netcheck")
+	}
 
 	// Get the actual port that was assigned
 	port := conn.LocalPort()

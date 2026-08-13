@@ -68,6 +68,26 @@ func TestCGNATRange(t *testing.T) {
 	}
 }
 
+func TestIsSyntheticDNSIP(t *testing.T) {
+	for _, tt := range []struct {
+		ip   string
+		want bool
+	}{
+		{"198.17.255.255", false},
+		{"198.18.0.0", true},
+		{"198.19.255.255", true},
+		{"198.20.0.0", false},
+		{"::ffff:198.18.1.2", true},
+		{"1.1.1.1", false},
+		{"2001:db8::1", false},
+	} {
+		ip := netip.MustParseAddr(tt.ip)
+		if got := IsSyntheticDNSIP(ip); got != tt.want {
+			t.Errorf("IsSyntheticDNSIP(%v) = %v, want %v", ip, got, tt.want)
+		}
+	}
+}
+
 var sinkIP netip.Addr
 
 func BenchmarkTailscaleServiceAddr(b *testing.B) {

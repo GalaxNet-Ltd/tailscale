@@ -227,6 +227,10 @@ type Client struct {
 	// If false, the default net.Resolver will be used, with no caching.
 	UseDNSCache bool
 
+	// DNSCache optionally specifies the resolver used when UseDNSCache is
+	// true. If nil, Client creates its historical default resolver lazily.
+	DNSCache *dnscache.Resolver
+
 	// if non-zero, force this DERP region to be preferred in all reports where
 	// the DERP is found to be reachable.
 	ForcePreferredDERP int
@@ -1643,14 +1647,17 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 
 	c.mu.Lock()
 	if c.UseDNSCache {
-		if c.resolver == nil {
+		resolver := c.DNSCache
+		if resolver == nil && c.resolver == nil {
 			c.resolver = &dnscache.Resolver{
 				Forward:     net.DefaultResolver,
 				UseLastGood: true,
 				Logf:        c.logf,
 			}
 		}
-		resolver := c.resolver
+		if resolver == nil {
+			resolver = c.resolver
+		}
 		lookupIPAddr = func(ctx context.Context, host string) ([]netip.Addr, error) {
 			_, _, allIPs, err := resolver.LookupIP(ctx, host)
 			return allIPs, err

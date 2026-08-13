@@ -22,6 +22,7 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -613,4 +614,27 @@ func (d *Dialer) PeerAPIHTTPClient() *http.Client {
 // and shared by callers.
 func (d *Dialer) PeerAPITransport() *http.Transport {
 	return d.PeerAPIHTTPClient().Transport.(*http.Transport)
+}
+
+// NewControlPlaneDNSResolver returns a resolver for control and DERP
+// hostnames. It rejects synthetic DNS addresses before they can be cached or
+// dialed, then tries the existing DERP bootstrap resolver followed by classic
+// DNS over the physical network.
+//
+// The returned Resolver is independent and safe for concurrent use.
+func (d *Dialer) NewControlPlaneDNSResolver(logf logger.Logf) *dnscache.Resolver {
+	if logf == nil {
+		logf = d.Logf
+	}
+	if logf != nil {
+		logf("dnsfallback: control-plane DNS safeguard enabled; rejecting 198.18.0.0/15, fallback order: DERP bootstrap then physical UDP/TCP")
+	}
+	return &dnscache.Resolver{
+		Forward:          dnscache.Get().Forward,
+		LookupIPFallback: dnsfallback.MakeLookupFuncWithPhysicalDNS(logf, d.NetMon()),
+		UseLastGood:      true,
+		ForwardTimeout:   2 * time.Second,
+		RejectIP:         tsaddr.IsSyntheticDNSIP,
+		Logf:             logf,
+	}
 }

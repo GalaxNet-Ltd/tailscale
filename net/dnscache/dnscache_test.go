@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -297,4 +298,98 @@ func TestSingleHostStaticResult(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolverRejectIP(t *testing.T) {
+	synthetic := netip.MustParseAddr("198.18.1.2")
+	mappedSynthetic := netip.MustParseAddr("::ffff:198.18.1.2")
+	real := netip.MustParseAddr("203.0.113.10")
+	rejectSynthetic := func(ip netip.Addr) bool {
+		return ip == synthetic
+	}
+
+	t.Run("synthetic-uses-fallback-and-logs", func(t *testing.T) {
+		var logs strings.Builder
+		forwardCalls, fallbackCalls := 0, 0
+		r := &Resolver{
+			Logf: func(format string, args ...any) {
+				fmt.Fprintf(&logs, format, args...)
+			},
+			RejectIP: rejectSynthetic,
+			LookupIPForTest: func(context.Context, string) ([]netip.Addr, error) {
+				forwardCalls++
+				return []netip.Addr{mappedSynthetic}, nil
+			},
+			LookupIPFallback: func(context.Context, string) ([]netip.Addr, error) {
+				fallbackCalls++
+				return []netip.Addr{real}, nil
+			},
+		}
+
+		ip, _, all, err := r.LookupIP(context.Background(), "control.example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ip != real || !slices.Equal(all, []netip.Addr{real}) {
+			t.Fatalf("LookupIP = %v, %v; want %v", ip, all, real)
+		}
+		if forwardCalls != 1 || fallbackCalls != 1 {
+			t.Fatalf("calls: forward=%d fallback=%d; want 1, 1", forwardCalls, fallbackCalls)
+		}
+		if got := logs.String(); !strings.Contains(got, `dnscache: rejected forward DNS answer for "control.example" containing synthetic IPs [198.18.1.2]`) {
+			t.Fatalf("missing always-on rejection log in %q", got)
+		}
+
+		// The accepted fallback result, rather than the synthetic forward
+		// result, is cached.
+		ip, _, _, err = r.LookupIP(context.Background(), "control.example")
+		if err != nil || ip != real {
+			t.Fatalf("cached LookupIP = %v, %v; want %v, nil", ip, err, real)
+		}
+		if forwardCalls != 1 || fallbackCalls != 1 {
+			t.Fatalf("cached lookup called resolvers: forward=%d fallback=%d", forwardCalls, fallbackCalls)
+		}
+	})
+
+	t.Run("mixed-answer-keeps-real-address", func(t *testing.T) {
+		fallbackCalls := 0
+		r := &Resolver{
+			Logf:     t.Logf,
+			RejectIP: rejectSynthetic,
+			LookupIPForTest: func(context.Context, string) ([]netip.Addr, error) {
+				return []netip.Addr{synthetic, real}, nil
+			},
+			LookupIPFallback: func(context.Context, string) ([]netip.Addr, error) {
+				fallbackCalls++
+				return nil, errors.New("unexpected fallback")
+			},
+		}
+		ip, _, all, err := r.LookupIP(context.Background(), "mixed.example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ip != real || !slices.Equal(all, []netip.Addr{real}) {
+			t.Fatalf("LookupIP = %v, %v; want only %v", ip, all, real)
+		}
+		if fallbackCalls != 0 {
+			t.Fatalf("fallback called %d times; want 0", fallbackCalls)
+		}
+	})
+
+	t.Run("fallback-answer-is-filtered", func(t *testing.T) {
+		r := &Resolver{
+			Logf:     t.Logf,
+			RejectIP: rejectSynthetic,
+			LookupIPForTest: func(context.Context, string) ([]netip.Addr, error) {
+				return []netip.Addr{synthetic}, nil
+			},
+			LookupIPFallback: func(context.Context, string) ([]netip.Addr, error) {
+				return []netip.Addr{mappedSynthetic}, nil
+			},
+		}
+		_, _, _, err := r.LookupIP(context.Background(), "bad-fallback.example")
+		if err == nil || !strings.Contains(err.Error(), "fallback returned no usable IPs") {
+			t.Fatalf("LookupIP error = %v; want no usable fallback IPs", err)
+		}
+	})
 }
