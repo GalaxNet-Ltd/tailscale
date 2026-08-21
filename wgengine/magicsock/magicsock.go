@@ -391,8 +391,10 @@ type Conn struct {
 	// wireguard state by its public key. If nil, it's not used.
 	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
 
-	// lastErrRebind tracks the last time a rebind was performed after
-	// experiencing a write error, and is used to throttle the rate of rebinds.
+	// lastErrRebind tracks the last time a rebind was claimed after
+	// experiencing a recoverable socket error, and is used to throttle the
+	// rate of rebinds. Callers must claim a rebind with CompareAndSwap so
+	// concurrent socket failures cannot all perform the same rebind.
 	lastErrRebind syncs.AtomicValue[time.Time]
 
 	// staticEndpoints are user set endpoints that this node should
@@ -1552,21 +1554,30 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap
 	return
 }
 
-// maybeRebindOnError performs a rebind and restun if the error is one that is
-// known to be healed by a rebind, and the rebind is not throttled.
-func (c *Conn) maybeRebindOnError(err error) {
+// maybeRebindOnError reports whether err is known to be healed by a rebind. If
+// it is, maybeRebindOnError performs a rebind and restun unless the rebind is
+// throttled.
+func (c *Conn) maybeRebindOnError(err error) bool {
 	ok, reason := shouldRebind(err)
 	if !ok {
-		return
+		return false
 	}
 
-	if c.lastErrRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
+	now := time.Now()
+	cutoff := now.Add(-5 * time.Second)
+	for {
+		last := c.lastErrRebind.Load()
+		if !last.Before(cutoff) {
+			return true
+		}
+		if !c.lastErrRebind.CompareAndSwap(last, now) {
+			continue
+		}
+
 		c.logf("magicsock: performing rebind due to %q", reason)
-		c.lastErrRebind.Store(time.Now())
 		c.Rebind()
 		go c.ReSTUN(reason)
-	} else {
-		c.logf("magicsock: not performing %q rebind due to throttle", reason)
+		return true
 	}
 }
 
@@ -1725,9 +1736,21 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 		batch := c.getReceiveBatchForBuffs(buffs)
 		defer c.putReceiveBatch(batch)
 		for {
+			readPConn := ruc.loadConn()
 			numMsgs, err := ruc.ReadBatch(batch.msgs[:len(buffs)], 0)
 			if err != nil {
 				if neterror.PacketWasTruncated(err) {
+					continue
+				}
+				// RebindingUDPConn is the stable WireGuard bind. A broken socket
+				// error can arrive before its replacement has been published, so
+				// keep the receive func alive while healing the underlying socket.
+				if c.bind.maybeRebindOnReceiveError(err) {
+					// A send path may already be performing the rebind while this
+					// receive observes the failed socket. Wait for publication instead
+					// of hot-looping on that socket. The timeout keeps recovery moving
+					// if a throttled rebind did not publish a replacement.
+					ruc.waitForConnChange(readPConn, time.Second)
 					continue
 				}
 				return 0, err
@@ -3435,6 +3458,17 @@ func (c *connBind) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.closed
+}
+
+// maybeRebindOnReceiveError attempts to heal a receive error without allowing
+// the bind to close between the lifecycle check and the rebind.
+func (c *connBind) maybeRebindOnReceiveError(err error) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.Conn.closing.Load() {
+		return false
+	}
+	return c.Conn.maybeRebindOnError(err)
 }
 
 // Close closes the connection.

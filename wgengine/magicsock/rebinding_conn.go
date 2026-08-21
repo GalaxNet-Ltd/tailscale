@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv6"
 	"tailscale.com/net/batching"
@@ -34,6 +35,12 @@ type RebindingUDPConn struct {
 	mu    syncs.Mutex // held while changing pconn (and pconnAtomic)
 	pconn nettype.PacketConn
 	port  uint16
+
+	// pconnChanged is closed whenever setConnLocked publishes a replacement
+	// socket, and when Close needs to wake recovery waiters. It lets a receive
+	// function wait for asynchronous rebind publication without repeatedly
+	// reading the same failed socket.
+	pconnChanged chan struct{}
 }
 
 // setConnLocked sets the provided nettype.PacketConn. It should be called only
@@ -47,6 +54,16 @@ func (c *RebindingUDPConn) setConnLocked(p nettype.PacketConn, network string, b
 	c.pconn = upc
 	c.pconnAtomic.Store(&upc)
 	c.port = uint16(c.localAddrLocked().Port)
+	c.notifyPConnChangedLocked()
+}
+
+// notifyPConnChangedLocked wakes waiters and prepares the notification used by
+// the next socket generation. c.mu must be held.
+func (c *RebindingUDPConn) notifyPConnChangedLocked() {
+	if c.pconnChanged != nil {
+		close(c.pconnChanged)
+	}
+	c.pconnChanged = make(chan struct{})
 }
 
 // currentConn returns c's current pconn, acquiring c.mu in the process.
@@ -54,6 +71,35 @@ func (c *RebindingUDPConn) currentConn() nettype.PacketConn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pconn
+}
+
+// loadConn returns c's current pconn without locking. It is used to snapshot
+// the socket on the receive hot path; recovery validates changes under c.mu.
+func (c *RebindingUDPConn) loadConn() nettype.PacketConn {
+	return *c.pconnAtomic.Load()
+}
+
+// waitForConnChange waits until previous is no longer the active socket, Close
+// wakes the waiter, or maxWait expires. The timeout is a bounded fallback for a
+// failed or throttled rebind; successful socket publication wakes immediately.
+func (c *RebindingUDPConn) waitForConnChange(previous nettype.PacketConn, maxWait time.Duration) {
+	c.mu.Lock()
+	if c.pconn != previous {
+		c.mu.Unlock()
+		return
+	}
+	if c.pconnChanged == nil {
+		c.pconnChanged = make(chan struct{})
+	}
+	changed := c.pconnChanged
+	c.mu.Unlock()
+
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-changed:
+	case <-timer.C:
+	}
 }
 
 func (c *RebindingUDPConn) readFromWithInitPconn(pconn nettype.PacketConn, b []byte) (int, netip.AddrPort, error) {
@@ -70,7 +116,7 @@ func (c *RebindingUDPConn) readFromWithInitPconn(pconn nettype.PacketConn, b []b
 // ReadFromUDPAddrPort reads a packet from c into b.
 // It returns the number of bytes copied and the source address.
 func (c *RebindingUDPConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
-	return c.readFromWithInitPconn(*c.pconnAtomic.Load(), b)
+	return c.readFromWithInitPconn(c.loadConn(), b)
 }
 
 // WriteWireGuardBatchTo writes buffs to addr. It serves primarily as an alias
@@ -162,7 +208,9 @@ var errNilPConn = errors.New("nil pconn")
 func (c *RebindingUDPConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.closeLocked()
+	err := c.closeLocked()
+	c.notifyPConnChangedLocked()
+	return err
 }
 
 func (c *RebindingUDPConn) closeLocked() error {

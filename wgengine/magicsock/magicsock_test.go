@@ -1840,6 +1840,108 @@ func TestRebindStress(t *testing.T) {
 	}
 }
 
+type readErrorPacketConn struct {
+	nettype.PacketConn
+	err     error
+	errRead chan struct{}
+	once    sync.Once
+	reads   atomic.Int32
+}
+
+func (c *readErrorPacketConn) ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error) {
+	c.reads.Add(1)
+	c.once.Do(func() { close(c.errRead) })
+	return 0, netip.AddrPort{}, c.err
+}
+
+func TestReceiveFuncSurvivesRecoverableSocketError(t *testing.T) {
+	if runtime.GOOS == "plan9" {
+		t.Skip("socket errors do not trigger rebinds on plan9")
+	}
+
+	conn := newTestConn(t)
+	defer conn.Close()
+
+	receiveFuncs, _, err := conn.bind.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errRead := make(chan struct{})
+	brokenConn := &readErrorPacketConn{
+		PacketConn: conn.pconn4.currentConn(),
+		err: &net.OpError{
+			Op:  "read",
+			Net: "udp4",
+			Err: syscall.ENOTCONN,
+		},
+		errRead: errRead,
+	}
+	conn.pconn4.mu.Lock()
+	conn.pconn4.setConnLocked(brokenConn, "udp4", conn.bind.BatchSize())
+	conn.pconn4.mu.Unlock()
+	// Model the physical-device race where another path has already started a
+	// rebind, so the receive-side request is throttled until that replacement is
+	// published.
+	conn.lastErrRebind.Store(time.Now())
+
+	errCh := make(chan error, 1)
+	go func() {
+		buffs := [][]byte{make([]byte, 1500)}
+		sizes := make([]int, 1)
+		eps := make([]wgconn.Endpoint, 1)
+		_, err := receiveFuncs[0](buffs, sizes, eps)
+		errCh <- err
+	}()
+
+	select {
+	case <-errRead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for injected read error")
+	}
+
+	// The receive function must wait for socket publication rather than
+	// repeatedly reading and logging the same immediate error.
+	time.Sleep(100 * time.Millisecond)
+	if got := brokenConn.reads.Load(); got != 1 {
+		t.Fatalf("failed UDP socket read %d times before replacement; want 1", got)
+	}
+
+	conn.Rebind()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for conn.pconn4.currentConn() == brokenConn {
+		select {
+		case err := <-errCh:
+			t.Fatalf("receive func returned during recoverable socket error: %v", err)
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("timed out waiting for replacement UDP socket")
+		}
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("receive func returned after UDP socket replacement: %v", err)
+	default:
+	}
+
+	if err := conn.bind.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("receive func returned %v after bind close; want net.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for receive func to stop after bind close")
+	}
+}
+
 func TestEndpointSetsEqual(t *testing.T) {
 	s := func(ports ...uint16) (ret []tailcfg.Endpoint) {
 		for _, port := range ports {
@@ -3269,6 +3371,41 @@ func TestMaybeRebindOnError(t *testing.T) {
 				}
 			}
 		})
+	})
+
+	t.Run("concurrent-errors-single-rebind", func(t *testing.T) {
+		if runtime.GOOS == "plan9" {
+			t.Skip("socket errors do not trigger rebinds on plan9")
+		}
+
+		conn := newTestConn(t)
+		defer conn.Close()
+
+		err := &net.OpError{Err: syscall.EPIPE}
+		const callers = 64
+		start := make(chan struct{})
+		var ready, done sync.WaitGroup
+		ready.Add(callers)
+		done.Add(callers)
+		for range callers {
+			go func() {
+				defer done.Done()
+				ready.Done()
+				<-start
+				if !conn.maybeRebindOnError(err) {
+					t.Errorf("recoverable socket error was not recognized")
+				}
+			}()
+		}
+
+		ready.Wait()
+		before := metricRebindCalls.Value()
+		close(start)
+		done.Wait()
+		after := metricRebindCalls.Value()
+		if got := after - before; got != 1 {
+			t.Fatalf("concurrent socket errors performed %d rebinds; want 1", got)
+		}
 	})
 }
 
